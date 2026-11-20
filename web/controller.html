@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Robot Controller</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--acc:#2f81f7;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--mut:#8b949e}
+*{box-sizing:border-box;touch-action:none;user-select:none;-webkit-user-select:none}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif;display:flex;flex-direction:column;height:100dvh}
+#top{position:relative;flex:1 1 38%;min-height:0;background:#000;display:flex;align-items:center;justify-content:center}
+#video{max-width:100%;max-height:100%;object-fit:contain}
+#hud{position:absolute;left:6px;right:6px;top:6px;display:flex;justify-content:space-between;gap:6px;flex-wrap:wrap;pointer-events:none}
+.pill{background:#000b;border-radius:12px;padding:3px 9px;font-size:12px;white-space:nowrap}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--bad);margin-right:5px}
+.dot.on{background:var(--ok)}
+#dist{position:absolute;left:6px;right:6px;bottom:6px;display:flex;justify-content:center;gap:8px}
+.d{background:#000b;border-radius:12px;padding:3px 12px;font-weight:700;font-size:15px}
+.d.warn{color:var(--warn)}.d.bad{color:var(--bad)}
+#mid{display:flex;gap:6px;padding:6px;flex-wrap:wrap;justify-content:center}
+button{background:var(--card);color:var(--fg);border:1px solid #30363d;border-radius:10px;padding:10px 14px;font-size:14px;font-weight:600}
+button.on{background:var(--acc);border-color:var(--acc)}
+button#estop{background:var(--bad);border-color:var(--bad);font-size:16px;padding:10px 22px}
+#sticks{flex:1 1 40%;min-height:0;display:flex;justify-content:space-around;align-items:center;padding:6px}
+.wrap{text-align:center;color:var(--mut);font-size:12px}
+.stick{position:relative;width:min(40vw,34dvh,190px);aspect-ratio:1;border-radius:50%;background:#1b2230;border:2px solid #30363d;margin:0 auto 4px}
+.knob{position:absolute;width:40%;height:40%;left:30%;top:30%;border-radius:50%;background:var(--acc);box-shadow:0 0 12px #2f81f788}
+#info{padding:4px 8px 8px;text-align:center;color:var(--mut);font-size:12px}
+</style>
+</head>
+<body>
+<div id="top">
+  <img id="video" alt="camera">
+  <div id="hud">
+    <span class="pill"><span id="conn" class="dot"></span><span id="connTxt">connecting</span></span>
+    <span class="pill" id="modePill">manual</span>
+    <span class="pill" id="statePill">idle</span>
+    <span class="pill" id="bat">battery –</span>
+  </div>
+  <div id="dist"><span class="d" id="dl">L –</span><span class="d" id="dr">R –</span></div>
+</div>
+<div id="mid">
+  <button id="bManual" class="on">Manual</button>
+  <button id="bAuto">Auto</button>
+  <button id="bTrack">Face track</button>
+  <button id="bVoice">Voice</button>
+  <button id="bCenter">Center cam</button>
+  <button id="estop">STOP</button>
+</div>
+<div id="sticks">
+  <div class="wrap"><div class="stick" id="drive"><div class="knob"></div></div>Drive</div>
+  <div class="wrap"><div class="stick" id="cam"><div class="knob"></div></div>Camera</div>
+</div>
+<div id="info">–</div>
+
+<script>
+let ws=null, open=false, last={};
+const $=id=>document.getElementById(id);
+
+function send(o){ if(ws && ws.readyState===1) ws.send(JSON.stringify(o)); }
+
+function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(`${proto}://${location.host}/ws/controller`);
+  ws.onopen=()=>{open=true; $('conn').className='dot on'; $('connTxt').textContent='connected'; $('video').src='/video?'+Date.now();};
+  ws.onclose=()=>{open=false; $('conn').className='dot'; $('connTxt').textContent='reconnecting…'; setTimeout(connect,1000);};
+  ws.onerror=()=>{try{ws.close()}catch(e){}};
+  ws.onmessage=ev=>{
+    let m; try{m=JSON.parse(ev.data)}catch(e){return}
+    if(m.type==='sensors'||m.type==='hello') update(m);
+    else if(m.type==='mode'){ setMode(m.mode); }
+    else if(m.type==='voice'){ $('bVoice').classList.toggle('on',m.enabled); }
+  };
+}
+
+function cm(v){return v==null?'–':Math.round(v)+' cm'}
+function cls(v){return v==null?'bad':(v<25?'bad':(v<60?'warn':''))}
+function setMode(m){ $('bManual').classList.toggle('on',m==='manual'); $('bAuto').classList.toggle('on',m==='auto'); $('modePill').textContent=m; }
+function update(s){
+  last=s;
+  $('dl').textContent='L '+cm(s.left); $('dl').className='d '+cls(s.left);
+  $('dr').textContent='R '+cm(s.right); $('dr').className='d '+cls(s.right);
+  setMode(s.mode);
+  $('bTrack').classList.toggle('on',!!s.tracking);
+  $('bVoice').classList.toggle('on',!!s.voice);
+  $('statePill').textContent=s.state+(s.person?' · person':'')+(s.following?' · following':'');
+  $('bat').textContent='battery '+(s.battery==null?'–':s.battery+'%'+(s.charging?' ⚡':''));
+  const bits=[];
+  if(s.fault) bits.push('SENSOR FAULT – forward blocked');
+  else if(s.blocked) bits.push('obstacle – forward blocked');
+  if(s.temp!=null) bits.push('CPU '+s.temp+'°C');
+  if(s.load!=null) bits.push('load '+s.load);
+  bits.push('brain: '+s.brain);
+  if(!s.camera) bits.push('no camera');
+  if(s.sim) bits.push('SIMULATION');
+  $('info').textContent=bits.join(' · ');
+}
+
+function makeStick(el,cb){
+  const knob=el.querySelector('.knob'); let id=null, vx=0, vy=0;
+  function upd(e){
+    const r=el.getBoundingClientRect(), cx=r.left+r.width/2, cy=r.top+r.height/2;
+    let dx=(e.clientX-cx)/(r.width/2), dy=(e.clientY-cy)/(r.height/2);
+    const m=Math.hypot(dx,dy); if(m>1){dx/=m;dy/=m}
+    vx=dx; vy=-dy;
+    knob.style.transform=`translate(${dx*r.width*0.3}px,${dy*r.height*0.3}px)`;
+  }
+  el.addEventListener('pointerdown',e=>{id=e.pointerId; el.setPointerCapture(id); upd(e);});
+  el.addEventListener('pointermove',e=>{if(e.pointerId===id) upd(e);});
+  const end=e=>{ if(e.pointerId!==id) return; id=null; vx=vy=0; knob.style.transform=''; cb(0,0,true); };
+  el.addEventListener('pointerup',end); el.addEventListener('pointercancel',end);
+  return {get:()=>({x:vx,y:vy,active:id!==null})};
+}
+
+const drive=makeStick($('drive'),(x,y)=>send({type:'drive',x:0,y:0}));
+const cam=makeStick($('cam'),()=>{});
+
+// 10 Hz command stream; the robot stops by itself if these stop arriving
+setInterval(()=>{
+  const d=drive.get(); if(d.active) send({type:'drive',x:+d.x.toFixed(2),y:+d.y.toFixed(2)});
+  const c=cam.get();   if(c.active) send({type:'camera',dpan:+c.x.toFixed(2),dtilt:+c.y.toFixed(2)});
+},100);
+
+$('bManual').onclick=()=>send({type:'mode',mode:'manual'});
+$('bAuto').onclick=()=>send({type:'mode',mode:'auto'});
+$('bTrack').onclick=()=>send({type:'tracking',enabled:!last.tracking});
+$('bVoice').onclick=()=>send({type:'voice',enabled:!last.voice});
+$('bCenter').onclick=()=>send({type:'camera_center'});
+$('estop').onclick=()=>send({type:'estop'});
+
+// leaving the page must never leave the robot driving
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) send({type:'estop'}); });
+addEventListener('blur',()=>send({type:'drive',x:0,y:0}));
+
+connect();
+</script>
+</body>
+</html>

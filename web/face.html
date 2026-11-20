@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Robot Face</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none}
+canvas{width:100vw;height:100vh;display:block}
+#dot{position:fixed;right:10px;top:10px;width:9px;height:9px;border-radius:50%;background:#f44;opacity:.6}
+#mic{position:fixed;left:10px;bottom:8px;color:#345;font:12px system-ui}
+#start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000d;color:#7df;font:600 22px system-ui;text-align:center}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dot"></div>
+<div id="mic"></div>
+<div id="start">Tap to wake the face</div>
+<script>
+const params=new URLSearchParams(location.search);
+const LANG=params.get('lang')||'en-US';
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const dot=document.getElementById('dot'), micEl=document.getElementById('mic');
+let W=0,H=0;
+function resize(){ W=cv.width=innerWidth*devicePixelRatio; H=cv.height=innerHeight*devicePixelRatio; }
+addEventListener('resize',resize); resize();
+
+// ---------- expressions: open (eye height), lid (top lid cover), tilt (lid angle), smile (bottom lid), scale
+const EXPR={
+  normal:   {open:1.0, lid:0,    tilt:0,   smile:0,   scale:1.0},
+  listening:{open:1.1, lid:0,    tilt:0,   smile:0,   scale:1.12},
+  thinking: {open:0.8, lid:0.28, tilt:8,   smile:0,   scale:0.96},
+  speaking: {open:1.0, lid:0,    tilt:0,   smile:0.1, scale:1.0},
+  happy:    {open:0.85,lid:0,    tilt:0,   smile:1.0, scale:1.05},
+  surprised:{open:1.25,lid:0,    tilt:0,   smile:0,   scale:1.22},
+  confused: {open:0.9, lid:0.22, tilt:14,  smile:0,   scale:1.0},
+  concerned:{open:1.0, lid:0.15, tilt:-16, smile:0,   scale:1.05},
+  sarcastic:{open:0.6, lid:0.4,  tilt:0,   smile:0,   scale:1.0},
+};
+const STATE_EXPR={idle:'normal',listening:'listening',thinking:'thinking',speaking:'speaking'};
+const cur={...EXPR.normal};
+let state='idle', override=null, overrideUntil=0, searching=false, voiceOn=false, started=false;
+let look={x:0,y:0}, lookT={x:0,y:0}, lookUntil=0, nextIdle=0;
+let blinkP=-1, nextBlink=2, last=0, heardUntil=0;
+
+function exprName(t){
+  if(override && t<overrideUntil) return override;
+  if(performance.now()/1000<heardUntil && state!=='speaking' && state!=='thinking') return 'listening';
+  return STATE_EXPR[state]||'normal';
+}
+
+function rrect(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+function drawEye(cx,cy,ew,eh,side,blink){
+  const h=Math.max(eh*0.04, eh*cur.open*(1-blink));
+  ctx.save();
+  rrect(cx-ew/2,cy-h/2,ew,h,Math.min(ew,h)*0.45);
+  ctx.shadowColor='#3ee0ff'; ctx.shadowBlur=ew*0.25;
+  ctx.fillStyle='#7df3ff'; ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.clip();
+  // top lid (rotated, mirrored per eye)
+  ctx.save();
+  ctx.translate(cx,cy-h/2);
+  ctx.rotate(side*cur.tilt*Math.PI/180);
+  ctx.fillStyle='#000';
+  ctx.fillRect(-ew,-h*1.5,ew*2,h*1.5+cur.lid*h);
+  ctx.restore();
+  // bottom lid dome for the happy squint
+  ctx.fillStyle='#000';
+  ctx.beginPath();
+  ctx.ellipse(cx,cy+h/2+0.25*h*(1-cur.smile),ew*0.8,h*(0.25+0.15*cur.smile),0,0,Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function frame(ts){
+  const t=ts/1000, dt=Math.min(0.05,t-last||0.016); last=t;
+  const tgt=EXPR[exprName(t)]||EXPR.normal;
+  for(const k in cur) cur[k]+=(tgt[k]-cur[k])*Math.min(1,dt*10);
+
+  // blinking
+  if(blinkP<0 && t>nextBlink) blinkP=0;
+  if(blinkP>=0){
+    blinkP+=dt/0.16;
+    if(blinkP>=1){ blinkP=-1; nextBlink=t+2+Math.random()*3.5; if(Math.random()<0.15) nextBlink=t+0.25; }
+  }
+  const blink=blinkP>=0?Math.sin(Math.PI*blinkP):0;
+
+  // gaze: follow a person if told to, otherwise idle wandering (wide sweeps while searching)
+  if(t>lookUntil && t>nextIdle){
+    if(searching){ lookT.x=(Math.random()*2-1)*0.95; lookT.y=(Math.random()*2-1)*0.3; nextIdle=t+0.7+Math.random()*0.6; }
+    else { lookT.x=(Math.random()*2-1)*0.4; lookT.y=(Math.random()*2-1)*0.25; nextIdle=t+1.5+Math.random()*3; }
+  }
+  const k=Math.min(1,dt*(searching?6:8));
+  look.x+=(lookT.x-look.x)*k; look.y+=(lookT.y-look.y)*k;
+
+  // talking pulse
+  const talk=(state==='speaking')?(Math.sin(t*13)*0.06+Math.sin(t*7.3)*0.04):0;
+
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  const ew=Math.min(W*0.2,H*0.55)*cur.scale;
+  const eh=Math.min(H*0.5,ew*1.5)*(1+talk);
+  const gap=W*0.24;
+  const ox=look.x*W*0.05, oy=look.y*H*0.08;
+  drawEye(W/2-gap+ox,H/2+oy,ew,eh,-1,blink);
+  drawEye(W/2+gap+ox,H/2+oy,ew,eh, 1,blink);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- WebSocket
+let ws=null;
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(`${proto}://${location.host}/ws/face`);
+  ws.onopen=()=>{dot.style.background='#3f3';};
+  ws.onclose=()=>{dot.style.background='#f44'; stopRec(); setTimeout(connect,1000);};
+  ws.onerror=()=>{try{ws.close()}catch(e){}};
+  ws.onmessage=ev=>{
+    let m; try{m=JSON.parse(ev.data)}catch(e){return}
+    const now=performance.now()/1000;
+    if(m.type==='hello'){ voiceOn=!!m.voice; state=m.state||'idle'; syncMic(); }
+    else if(m.type==='state'){ state=m.state; syncMic(); }
+    else if(m.type==='voice'){ voiceOn=!!m.enabled; syncMic(); }
+    else if(m.type==='expression'){ override=m.name; overrideUntil=now+(m.hold||3); }
+    else if(m.type==='searching'){ searching=!!m.on; }
+    else if(m.type==='look' && m.present){ lookT.x=Math.max(-1,Math.min(1,m.x)); lookT.y=Math.max(-1,Math.min(1,m.y)); lookUntil=now+1.5; }
+  };
+}
+setInterval(()=>send({type:'ping'}),10000);
+connect();
+
+// ---------- speech recognition (Chrome/Android; needs HTTPS and internet)
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let rec=null;
+function wantMic(){ return started && voiceOn && (state==='listening'||state==='idle'); }
+function syncMic(){ if(wantMic()) startRec(); else stopRec(); }
+function stopRec(){ if(rec){ const r=rec; rec=null; try{r.abort()}catch(e){} } micEl.textContent=''; }
+function startRec(){
+  if(rec) return;
+  if(!SR){ micEl.textContent='speech recognition not supported in this browser'; return; }
+  const r=new SR(); rec=r;
+  r.lang=LANG; r.continuous=false; r.interimResults=true;
+  r.onstart=()=>{ micEl.textContent='mic on'; };
+  r.onresult=e=>{
+    heardUntil=performance.now()/1000+1.2;           // eyes perk up while someone talks
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      if(e.results[i].isFinal){
+        const txt=e.results[i][0].transcript.trim();
+        if(txt) send({type:'speech_text',text:txt});
+      }
+    }
+  };
+  r.onerror=e=>{
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){ micEl.textContent='microphone blocked (needs HTTPS + permission)'; rec=null; voiceOn=false; }
+    else if(e.error!=='no-speech'&&e.error!=='aborted'){ micEl.textContent='mic error: '+e.error; }
+  };
+  r.onend=()=>{ if(rec===r){ rec=null; if(wantMic()) setTimeout(startRec,300); } };
+  try{ r.start(); }catch(e){ rec=null; }
+}
+
+// ---------- start overlay: needs one tap for fullscreen, mic permission and wake lock
+document.getElementById('start').addEventListener('click',async()=>{
+  document.getElementById('start').style.display='none';
+  started=true;
+  try{ await document.documentElement.requestFullscreen(); }catch(e){}
+  try{ if(navigator.wakeLock) await navigator.wakeLock.request('screen'); }catch(e){}
+  syncMic();
+});
+</script>
+</body>
+</html>
